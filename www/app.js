@@ -2,11 +2,15 @@
 // Painel único com o que precisa de atenção no Helpdesk, na Gestão de Ativos e nas Solicitações de Compra.
 // Os números vêm da função hub_resumo() do banco, que respeita as regras de acesso de quem está logado.
 "use strict";
-const VERSAO = "1.0.0";
+const VERSAO = "1.1.0";
 const CFG = window.HUB_CONFIG;
 const URL_ = CFG.sistemas;
 const sb = supabase.createClient(CFG.supabaseUrl, CFG.supabaseKey, { auth: { persistSession: true, autoRefreshToken: true, storageKey: "hub-ti-auth" } });
 
+// Fornecedores fica em outro projeto Supabase: login próprio (e-mail e senha), guardado à parte.
+const FN = CFG.fornecedores;
+const sbF = supabase.createClient(FN.supabaseUrl, FN.supabaseKey, { auth: { persistSession: true, autoRefreshToken: true, storageKey: "hub-forn-auth" } });
+const F = { user: null, d: null, erro: "", msg: "", entrando: false, email: lsGet("hub_forn_email") || "" };
 const S = { user: null, d: null, erro: "", semAcesso: false, carregando: false, filtro: "tudo", ultima: null };
 const L = { etapa: "email", email: lsGet("hub_email") || "", senha: false, msg: "" };
 
@@ -37,6 +41,7 @@ const link = {
   ga: () => `${URL_.ativos}/`,
   sol: id => `${URL_.compras}/#s/${encodeURIComponent(id)}`,
   fc: v => `${URL_.compras}/${v ? "#v/" + v : ""}`,
+  fn: () => `${URL_.fornecedores}/`,
 };
 const TIPO = { notebook: "Notebook", desktop: "Desktop", celular: "Celular", tablet: "Tablet", impressora: "Impressora", coletor: "Coletor", monitor: "Monitor", periferico: "Periférico", switch: "Switch", servidor: "Servidor", roteador: "Roteador", firewall: "Firewall", access_point: "Access point", nobreak: "Nobreak" };
 const CAMPO = { garantia_ate: "Garantia", licenca_ate: "Licença", troca_bateria: "Troca de bateria" };
@@ -89,11 +94,54 @@ async function carregar(silencioso) {
   if (S.carregando) return; S.carregando = true;
   const b = $("bRef"); if (b) b.classList.add("spin");
   try {
-    const { data, error } = await sb.rpc("hub_resumo");
+    const [{ data, error }] = await Promise.all([sb.rpc("hub_resumo"), carregarForn()]);
     if (error) { if (/Sem acesso/i.test(error.message)) { S.semAcesso = true; S.d = null; } else throw error; }
     else { S.d = data; S.semAcesso = false; S.erro = ""; S.ultima = Date.now(); }
   } catch (e) { console.error(e); S.erro = "Não foi possível atualizar agora. Tentando de novo em instantes."; if (!silencioso) setTimeout(() => carregar(true), 15000); }
   S.carregando = false; render();
+}
+async function carregarForn() {
+  if (!F.user) return;
+  try {
+    const hoje = hojeISO();
+    const [f, c, i, sv] = await Promise.all([
+      sbF.from("fornecedores").select("id,nome,status"),
+      sbF.from("contratos").select("id,fornecedor_id,numero_contrato,tipo_servico,valor_mensal,data_vencimento,status,status_pagamento,criticidade,renovacao_automatica"),
+      sbF.from("incidentes").select("id,fornecedor_id,titulo,status,impacto,data_abertura,sla_horas,protocolo").in("status", ["aberto", "em_andamento"]),
+      sbF.from("servicos").select("id,fornecedor_id,nome,status,criticidade"),
+    ]);
+    const erro = f.error || c.error || i.error || sv.error; if (erro) throw erro;
+    const nome = Object.fromEntries((f.data || []).map(x => [x.id, x.nome]));
+    const ativos = (c.data || []).filter(x => x.status === "ativo");
+    const comVenc = ativos.filter(x => x.data_vencimento).map(x => ({ ...x, fornecedor: nome[x.fornecedor_id] || "", dias: diasAte(x.data_vencimento) }));
+    const inc = (i.data || []).map(x => {
+      const h = (Date.now() - new Date(x.data_abertura).getTime()) / 36e5;
+      return { ...x, fornecedor: nome[x.fornecedor_id] || "", horas: h, estourado: x.sla_horas != null && h > Number(x.sla_horas) };
+    });
+    F.d = {
+      fornecedores: (f.data || []).filter(x => x.status === "ativo").length,
+      contratos: ativos.length,
+      custo: ativos.reduce((t, x) => t + Number(x.valor_mensal || 0), 0),
+      vencidos: comVenc.filter(x => x.dias < 0 && !x.renovacao_automatica),
+      vencendo: comVenc.filter(x => x.dias >= 0 && x.dias <= 60),
+      pendentes: ativos.filter(x => x.status_pagamento === "pendente").map(x => ({ ...x, fornecedor: nome[x.fornecedor_id] || "" })),
+      incidentes: inc,
+      foraDoAr: (sv.data || []).filter(x => x.status === "fora_do_ar").map(x => ({ ...x, fornecedor: nome[x.fornecedor_id] || "" })),
+    };
+    F.erro = "";
+  } catch (e) {
+    console.error(e);
+    if (/JWT|token|401/i.test(String(e.message || e.code))) { await sbF.auth.signOut(); F.user = null; F.d = null; }
+    else F.erro = "Não foi possível ler os dados de fornecedores agora.";
+  }
+}
+async function loginForn(f) {
+  const email = f.querySelector("[name=email]").value.trim(), senha = f.querySelector("[name=senha]").value;
+  F.email = email; lsSet("hub_forn_email", email); F.entrando = true; F.msg = ""; render();
+  const { data, error } = await sbF.auth.signInWithPassword({ email, password: senha });
+  F.entrando = false;
+  if (error) { F.msg = /Invalid login/i.test(error.message) ? "E-mail ou senha incorretos." : error.message; render(); return; }
+  F.user = data.user; await carregarForn(); render();
 }
 let canal = null, rtTimer = null, relogio = null;
 function ouvir() {
@@ -147,6 +195,14 @@ function atencao(d) {
     const peso = s.urgente ? 1 : s.status === "aguardando_aprovacao" || s.status === "comprovante_enviado" ? 2 : 3;
     it.push({ s: "compras", t: `${cod(s.id)} · ${s.titulo}`, m: [s.solicitante, FC_ST[s.status], s.valor_estimado ? brl(s.valor_estimado) : ""].filter(Boolean).join(" · "), w: s.urgente ? "Urgente" : prazo != null ? (prazo < 0 ? "Prazo passou" : "Até " + fDia(s.necessario_ate)) : "Há " + rel(s.criado_em), cls: s.urgente || (prazo != null && prazo < 0) ? "bad" : peso === 2 ? "warn" : "soft", peso, href: link.sol(s.id) });
   });
+  const fd = F.d;
+  if (fd) {
+    fd.foraDoAr.forEach(x => it.push({ s: "fornecedores", t: `Fora do ar: ${x.nome}`, m: [x.fornecedor, x.criticidade && "criticidade " + x.criticidade].filter(Boolean).join(" · "), w: "Fora do ar", cls: "bad", peso: 0, href: link.fn() }));
+    fd.incidentes.forEach(x => it.push({ s: "fornecedores", t: `Incidente: ${x.titulo}`, m: [x.fornecedor, x.protocolo && "protocolo " + x.protocolo, x.impacto && "impacto " + x.impacto].filter(Boolean).join(" · "), w: x.estourado ? "SLA estourado" : "Aberto há " + tempo(x.horas * 36e5), cls: x.estourado ? "bad" : x.impacto === "alto" ? "warn" : "soft", peso: x.estourado ? 0 : x.impacto === "alto" ? 1 : 2, href: link.fn() }));
+    fd.vencidos.forEach(x => it.push({ s: "fornecedores", t: `Contrato vencido: ${x.fornecedor || x.numero_contrato || "sem nome"}`, m: [x.tipo_servico, x.valor_mensal ? brl(x.valor_mensal) + "/mês" : ""].filter(Boolean).join(" · "), w: "Venceu em " + fDia(x.data_vencimento), cls: "bad", peso: 0, href: link.fn() }));
+    fd.vencendo.forEach(x => it.push({ s: "fornecedores", t: `Contrato: ${x.fornecedor || x.numero_contrato || "sem nome"}`, m: [x.tipo_servico, x.renovacao_automatica ? "renovação automática" : "sem renovação automática", x.valor_mensal ? brl(x.valor_mensal) + "/mês" : ""].filter(Boolean).join(" · "), w: x.dias === 0 ? "Vence hoje" : "Vence em " + plural(x.dias, "dia", "dias"), cls: x.renovacao_automatica ? "soft" : x.dias <= 15 ? "bad" : "warn", peso: x.renovacao_automatica ? 3 : x.dias <= 15 ? 1 : 2, href: link.fn() }));
+    fd.pendentes.forEach(x => it.push({ s: "fornecedores", t: `Pagamento pendente: ${x.fornecedor || x.numero_contrato || "contrato"}`, m: [x.tipo_servico, x.valor_mensal ? brl(x.valor_mensal) : ""].filter(Boolean).join(" · "), w: "Pendente", cls: "warn", peso: 2, href: link.fn() }));
+  }
   return it.sort((a, b) => a.peso - b.peso);
 }
 
@@ -161,7 +217,13 @@ function resumoFrase(d) {
   const aprov = num(d.ativos.compras_aprovar) + num(d.compras.aprovar);
   if (aprov) p.push(`<b>${plural(aprov, "compra", "compras")}</b> aguardando aprovação`);
   if (num(d.compras.conferir)) p.push(`<b>${plural(num(d.compras.conferir), "comprovante", "comprovantes")}</b> para conferir`);
-  if (!p.length) return "Nada urgente agora. Tudo em dia nos três sistemas.";
+  if (F.d) {
+    const inc = F.d.incidentes.filter(x => x.estourado).length, venc = F.d.vencidos.length + F.d.vencendo.filter(x => !x.renovacao_automatica && x.dias <= 30).length;
+    if (F.d.foraDoAr.length) p.push(`<b>${plural(F.d.foraDoAr.length, "serviço", "serviços")}</b> de fornecedor fora do ar`);
+    if (inc) p.push(`<b>${plural(inc, "incidente", "incidentes")}</b> de fornecedor com SLA estourado`);
+    if (venc) p.push(`<b>${plural(venc, "contrato", "contratos")}</b> vencendo`);
+  }
+  if (!p.length) return "Nada urgente agora. Tudo em dia nos sistemas.";
   const ult = p.pop(); return (p.length ? p.join(", ") + " e " + ult : ult) + ".";
 }
 function met(label, n, href, nivel) {
@@ -209,23 +271,46 @@ function cardsHTML(d) {
       met("Comprovantes para conferir", c.conferir, link.fc("conferencia"), "warn"),
       met("Assinaturas ativas", c.assinaturas, link.fc("assinaturas"), "ok"),
     ], "", num(c.valor_aberto) ? `Valor estimado em aberto: <b>${esc(brl(c.valor_aberto))}</b>` : "Nenhum valor em aberto")}
+    ${cardForn()}
   </div>`;
+}
+function cardForn() {
+  if (!F.user) return `<section class="card sc" data-s="fornecedores" aria-label="Fornecedores"><div class="stripe"></div>
+    <div class="sch"><div class="sico">${ICON("truck")}</div><div><b>Fornecedores</b><small>fornecedores.grupozerbini.com.br</small></div>
+      <a class="open" href="${esc(link.fn())}" target="_blank" rel="noopener">Abrir ${ICON("ext")}</a></div>
+    <form class="flog" id="fForn"><p class="muted">Fica em outro banco. Entre uma vez com o seu login do sistema de fornecedores; o hub lembra.</p>
+      <input name="email" type="email" autocomplete="username" placeholder="E-mail" required value="${esc(F.email)}" aria-label="E-mail do sistema de fornecedores">
+      <input name="senha" type="password" autocomplete="current-password" placeholder="Senha" required aria-label="Senha do sistema de fornecedores">
+      ${F.msg ? `<div class="err">${esc(F.msg)}</div>` : ""}
+      <button class="btn" ${F.entrando ? "disabled" : ""}>${F.entrando ? "Entrando…" : "Conectar fornecedores"}</button></form></section>`;
+  const d = F.d;
+  if (!d) return `<section class="card sc" data-s="fornecedores"><div class="stripe"></div><div class="sch"><div class="sico">${ICON("truck")}</div><div><b>Fornecedores</b><small>fornecedores.grupozerbini.com.br</small></div></div>
+    <div class="foot">${F.erro ? esc(F.erro) : "Carregando…"}</div></section>`;
+  const venc30 = d.vencendo.filter(x => x.dias <= 30).length;
+  return cardSistema("fornecedores", "Fornecedores", "fornecedores.grupozerbini.com.br", "truck", d.fornecedores, "fornecedores ativos", [
+    met("Serviços fora do ar", d.foraDoAr.length, link.fn(), "bad"),
+    met("Incidentes em aberto", d.incidentes.length, link.fn(), "warn"),
+    met("Incidentes com SLA estourado", d.incidentes.filter(x => x.estourado).length, link.fn(), "bad"),
+    met("Contratos vencidos", d.vencidos.length, link.fn(), "bad"),
+    met("Contratos vencendo em 30 dias", venc30, link.fn(), "warn"),
+    met("Pagamentos pendentes", d.pendentes.length, link.fn(), "warn"),
+  ], "", `${d.contratos} contratos ativos · <b>${esc(brl(d.custo))}</b>/mês <button class="linkbtn" style="font-size:12px;float:right" data-act="fsair">Desconectar</button>`);
 }
 function atencaoHTML(d) {
   const todos = atencao(d);
-  const cont = { tudo: todos.length, helpdesk: 0, ativos: 0, compras: 0 }; todos.forEach(i => cont[i.s]++);
+  const cont = { tudo: todos.length, helpdesk: 0, ativos: 0, compras: 0, fornecedores: 0 }; todos.forEach(i => cont[i.s]++);
   const lista = S.filtro === "tudo" ? todos : todos.filter(i => i.s === S.filtro);
   const chip = (k, l) => `<button class="chip ${S.filtro === k ? "on" : ""}" data-act="filtro" data-v="${k}" aria-pressed="${S.filtro === k}">${l} ${cont[k]}</button>`;
   return `<section class="card panel" aria-label="Precisa de você">
     <div class="ph"><h2>Precisa de você</h2><span class="cnt">mais urgente primeiro</span></div>
-    <div class="filt">${chip("tudo", "Tudo")}${chip("helpdesk", "Helpdesk")}${chip("ativos", "Ativos")}${chip("compras", "Compras")}</div>
+    <div class="filt">${chip("tudo", "Tudo")}${chip("helpdesk", "Helpdesk")}${chip("ativos", "Ativos")}${chip("compras", "Compras")}${F.d ? chip("fornecedores", "Fornecedores") : ""}</div>
     ${lista.length ? `<ul class="att">${lista.slice(0, 14).map(i => `<li><a href="${esc(i.href)}" target="_blank" rel="noopener">
-      <span class="tag ${i.s}">${{ helpdesk: "Helpdesk", ativos: "Ativos", compras: "Compras" }[i.s]}</span>
+      <span class="tag ${i.s}">${{ helpdesk: "Helpdesk", ativos: "Ativos", compras: "Compras", fornecedores: "Fornec." }[i.s]}</span>
       <span class="t" title="${esc(i.t)}">${esc(i.t)}</span>
       <span class="w ${i.cls}">${esc(i.w)}</span>
       <span class="m">${esc(i.m)}</span></a></li>`).join("")}</ul>
       ${lista.length > 14 ? `<p class="faint" style="margin:8px 6px 0;font-size:13px">E mais ${lista.length - 14}. Abra o sistema para ver tudo.</p>` : ""}`
-      : `<div class="empty"><b>Tudo em dia</b>Nada pendente ${S.filtro === "tudo" ? "nos três sistemas" : "aqui"}.</div>`}
+      : `<div class="empty"><b>Tudo em dia</b>Nada pendente ${S.filtro === "tudo" ? "nos sistemas" : "aqui"}.</div>`}
   </section>`;
 }
 function tarefasHTML(d) {
@@ -300,6 +385,7 @@ document.addEventListener("submit", e => {
   e.preventDefault();
   if (e.target.id === "fEmail") loginEmail(e.target);
   if (e.target.id === "fCodigo") loginCodigo(e.target);
+  if (e.target.id === "fForn") loginForn(e.target);
 });
 document.addEventListener("click", async e => {
   const el = e.target.closest("[data-act]"); if (!el) return;
@@ -309,7 +395,8 @@ document.addEventListener("click", async e => {
   else if (a === "filtro") { S.filtro = el.dataset.v; render(); }
   else if (a === "atualizar") carregar();
   else if (a === "tema") { const t = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = t; lsSet("hub_tema", t); }
-  else if (a === "sair") { if (canal) { sb.removeChannel(canal); canal = null; } clearInterval(relogio); await sb.auth.signOut(); S.user = null; S.d = null; S.semAcesso = false; L.etapa = "email"; render(); }
+  else if (a === "fsair") { await sbF.auth.signOut(); F.user = null; F.d = null; render(); }
+  else if (a === "sair") { await sbF.auth.signOut(); F.user = null; F.d = null; if (canal) { sb.removeChannel(canal); canal = null; } clearInterval(relogio); await sb.auth.signOut(); S.user = null; S.d = null; S.semAcesso = false; L.etapa = "email"; render(); }
 });
 
 // ---------- início ----------
@@ -318,4 +405,5 @@ sb.auth.onAuthStateChange((ev, sess) => {
   if (u && (!S.user || S.user.id !== u.id)) { S.user = u; S.d = null; render(); setTimeout(() => carregar().then(() => { if (!S.semAcesso) ouvir(); }), 0); }
   else if (!u && S.user) { S.user = null; S.d = null; render(); }
 });
+sbF.auth.getSession().then(({ data }) => { if (data.session) { F.user = data.session.user; if (S.user) carregarForn().then(render); } });
 sb.auth.getSession().then(({ data }) => { if (!data.session) render(); });

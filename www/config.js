@@ -6,6 +6,12 @@ window.HUB_CONFIG = {
   sistemas: {
     helpdesk: "https://chamados.grupozerbini.com.br",
     ativos: "https://ativos.grupozerbini.com.br",
-    compras: "https://compras.grupozerbini.com.br"
+    compras: "https://compras.grupozerbini.com.br",
+    fornecedores: "https://fornecedores.grupozerbini.com.br"
+  },
+  // Fornecedores fica em outro projeto Supabase (outra conta)
+  fornecedores: {
+    supabaseUrl: "https://ivxclpslwrzjwrbucftg.supabase.co",
+    supabaseKey: "sb_publishable_rLSJa90SnYJWxEz2VHumVg_7nvsP8yx"
   }
 };
